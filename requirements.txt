@@ -13,5 +13,5 @@ sqlalchemy
 faiss-cpu
 sentence-transformers
 tiktoken
-google-generativeai
+google-ai-generativelanguage
 ollama
