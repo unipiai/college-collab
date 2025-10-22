@@ -6,6 +6,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_deepseek import ChatDeepSeek
 from langchain_huggingface import HuggingFaceEmbeddings
 import os
+import json
 from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -18,10 +19,95 @@ from langchain.agents import create_agent
 from langchain_community.callbacks import get_openai_callback
 from langchain_core.callbacks import BaseCallbackHandler
 import time
+import pathlib
 
-load_dotenv()
+# load_dotenv()
 
-# Custom callback handler to track tokens for non-OpenAI models
+def _download_db():
+    url = "https://drive.google.com/uc?export=download&id=1x0f_hL-69JDG4-gS3d8owyjOjdxpB9Ql"
+    local_path = pathlib.Path("schools.db")
+
+    if local_path.exists():
+        print(f"{local_path} already exists, skipping download.")
+    else:
+        response = requests.get(url)
+        if response.status_code == 200:
+            local_path.write_bytes(response.content)
+            print(f"File downloaded and saved as {local_path}")
+        else:
+            print(f"Failed to download the file. Status code: {response.status_code}")
+ 
+
+# -------------------------
+# Authentication utilities
+# -------------------------
+def _load_users():
+    """
+    Pull users from st.secrets.
+    Prefer [auth.users] as a key-value map of username=password.
+    Falls back to APP_USERNAME/APP_PASSWORD if present in secrets.
+    """
+    users = {}
+    # Preferred nested structure
+    if "auth" in st.secrets and "users" in st.secrets["auth"]:
+        # st.secrets returns a Secrets object, cast to dict
+        users = dict(st.secrets["auth"]["users"])
+    else:
+        # Optional single-user fallback in secrets
+        u = st.secrets.get("APP_USERNAME", None)
+        p = st.secrets.get("APP_PASSWORD", None)
+        if u and p:
+            users[str(u)] = str(p)
+    return users
+
+def authenticate(username: str, password: str) -> bool:
+    users = _load_users()
+    if not users:
+        # If no users configured, fall back to default credentials from secrets (or hardcoded dev default)
+        auth_section = st.secrets.get("auth", {})
+        return username and password
+    stored = users.get(username)
+    return stored is not None and str(stored) == str(password)
+
+def _load_api_keys_once():
+    """
+    Copy [api_keys] from st.secrets into os.environ only once per session,
+    and only after authentication.
+    """
+    if st.session_state.get("api_keys_loaded"):
+        return
+    if "api_keys" in st.secrets:
+        for k, v in st.secrets["api_keys"].items():
+            if v:
+                os.environ[str(k)] = str(v)
+        st.session_state.api_keys_loaded = True
+
+def _unload_api_keys():
+    """
+    Remove any previously loaded API keys from process env on sign-out.
+    """
+    if "api_keys" in st.secrets:
+        for k in list(st.secrets["api_keys"].keys()):
+            os.environ.pop(str(k), None)
+    st.session_state.api_keys_loaded = False
+
+def sign_out():
+    # Clear authentication and app state for a clean logout
+    _unload_api_keys() 
+    keys_to_clear = [
+        "authenticated", "user", "db", "engine", "model",
+        "embeddings", "vectorstore", "usable_tables",
+        "messages", "token_stats"
+    ]
+    for k in keys_to_clear:
+        if k in st.session_state:
+            del st.session_state[k]
+    st.rerun()
+
+
+# -------------------------
+# Token tracking callback
+# -------------------------
 class TokenCounterCallback(BaseCallbackHandler):
     def __init__(self):
         self.input_tokens = 0
@@ -40,7 +126,10 @@ class TokenCounterCallback(BaseCallbackHandler):
                 self.output_tokens += len(gen.text) // 4
         self.total_tokens = self.input_tokens + self.output_tokens
 
+
+# -------------------------
 # Page config
+# -------------------------
 st.set_page_config(
     page_title="SQL Agent with Embeddings",
     page_icon="🤖",
@@ -51,6 +140,37 @@ st.set_page_config(
 st.title("🤖 SQL Database Agent with Semantic Search")
 st.markdown("Ask questions about your database in natural language!")
 
+# -------------------------
+# Sidebar: Authentication
+# -------------------------
+with st.sidebar:
+    st.header("🔐 Account")
+
+    if not st.session_state.get("authenticated"):
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Sign In")
+            if submitted:
+                if authenticate(username, password):
+                    st.session_state.authenticated = True
+                    st.session_state.user = username
+                    st.success(f"Signed in as {username}")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+        st.info("Please sign in to use the app.")
+        st.stop()
+    else:
+        st.success(f"Signed in as {st.session_state.get('user', 'user')}")
+        _load_api_keys_once()  # << ensure keys are loaded for already-authenticated sessions
+        _download_db() # Ensure DB is downloaded
+        if st.button("Sign Out"):
+            sign_out()
+
+# -------------------------
+# Sidebar placeholders and config (only visible after login)
+# -------------------------
 # Sidebar status placeholder to show loading/progress messages
 sidebar_status = st.sidebar.empty()
 
@@ -61,7 +181,7 @@ with st.sidebar:
     # Model selection
     model_choice = st.selectbox(
         "Select LLM Model",
-        ["DeepSeek", "OpenAI GPT-4", "Ollama", "Google Gemini"],
+        ["DeepSeek", "OpenAI GPT-4", "Google Gemini"], # "Ollama" removed, include if needed
         index=0
     )
     
@@ -79,7 +199,7 @@ with st.sidebar:
     st.header("📊 Database Info")
     db_info_ph = st.empty()
     if "db" in st.session_state:
-         with db_info_ph.container():
+        with db_info_ph.container():
             st.success(f"✅ Connected to database")
             st.info(f"**Dialect:** {st.session_state.db.dialect}")
             if "usable_tables" in st.session_state:
@@ -87,11 +207,9 @@ with st.sidebar:
             else:
                 st.info(f"**Tables:** {len(st.session_state.db.get_usable_table_names())}")
     else:
-        # Show a sidebar notice while loading; the real spinner is started below
         with sidebar_status.container():
             st.info("Loading Data, please wait...")
 
-    
     st.divider()
     
     # Token stats
@@ -107,7 +225,9 @@ with st.sidebar:
     else:
         st.info("Run a query to see token usage")
 
+# -------------------------
 # Initialize session state
+# -------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -128,10 +248,8 @@ def _truncate(text, max_chars=1200):
         s = repr(text)
     return s if len(s) <= max_chars else s[:max_chars] + " ... [truncated]"
 
-  # Normalize any stream item into a message for stream_mode="messages"
+# Normalize any stream item into a message for stream_mode="messages"
 def _as_msg(step):
-    # Some runtimes yield (message, metadata), some yield just the message,
-    # older ones may yield dicts with "messages"
     try:
         from langchain_core.messages import BaseMessage
     except Exception:
@@ -140,15 +258,12 @@ def _as_msg(step):
         return step[0]
     if isinstance(step, dict) and "messages" in step:
         return step["messages"][-1]
-    # If it's a message already or unknown type, return as-is
     return step
- 
-  # Extract tool call name and args regardless of provider shape
+
+# Extract tool call name and args regardless of provider shape
 def _tc_name_args(tc):
     try:
-        # Dict-like shapes
         if isinstance(tc, dict):
-            # OpenAI tool/function calling shape
             if "function" in tc:
                 fn = tc["function"] or {}
                 return fn.get("name", ""), fn.get("arguments", {})
@@ -156,7 +271,6 @@ def _tc_name_args(tc):
                 tc.get("name") or tc.get("type") or "",
                 tc.get("args") or tc.get("arguments") or tc.get("input") or {},
             )
-        # Object-like shapes
         name = getattr(tc, "name", None) or getattr(tc, "type", "") or ""
         args = (
             getattr(tc, "args", None)
@@ -168,6 +282,9 @@ def _tc_name_args(tc):
     except Exception:
         return "", {}
 
+# -------------------------
+# DB and model initialization (post-login)
+# -------------------------
 if "db" not in st.session_state:
     # Run initialization with a spinner shown in the sidebar
     with db_info_ph.container():
@@ -193,11 +310,11 @@ if "db" not in st.session_state:
                         st.session_state.model = ChatDeepSeek(model="deepseek-chat")
                     elif model_choice == "OpenAI GPT-4":
                         st.session_state.model = ChatOpenAI(model="gpt-4")
-                    elif model_choice == "Ollama":
-                        st.session_state.model = ChatOllama(
-                            model="qwen2.5-coder:3b",
-                            base_url="http://localhost:11434"
-                        )
+                    # elif model_choice == "Ollama":
+                    #     st.session_state.model = ChatOllama(
+                    #         model="qwen2.5-coder:3b",
+                    #         base_url="http://localhost:11434"
+                    #     )
                     else:  # Google Gemini
                         st.session_state.model = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp")
                     
@@ -268,7 +385,9 @@ if "db" not in st.session_state:
                 st.info(f"**Dialect:** {st.session_state.db.dialect}")
                 st.info(f"**Tables:** {len(st.session_state.usable_tables) if 'usable_tables' in st.session_state else len(st.session_state.db.get_usable_table_names())}")
 
+# -------------------------
 # Display chat messages
+# -------------------------
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
@@ -279,7 +398,9 @@ for message in st.session_state.messages:
                 cols[1].metric("Output", message["token_info"]["output"])
                 cols[2].metric("Total", message["token_info"]["total"])
 
-# Chat input
+# -------------------------
+# Chat input and agent logic
+# -------------------------
 if question := st.chat_input("Ask a question about the database..."):
     # Add user message
     st.session_state.messages.append({"role": "user", "content": question})
@@ -524,7 +645,7 @@ All available tables: {all_tables}
                     cols[1].metric("Output Tokens", output_tokens)
                     cols[2].metric("Total Tokens", total_tokens)
 
-                 # NEW: Show timing in an expander
+                # Timing expander
                 with st.expander("⏱️ Timing"):
                     st.metric("Response Time (s)", f"{elapsed_s:.2f}")
                 
