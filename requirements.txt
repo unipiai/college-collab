@@ -1,0 +1,17 @@
+streamlit
+requests
+python-dotenv
+langchain
+langchain-core
+langchain-community
+langchain-openai
+langchain-ollama
+langchain-google-genai
+langchain-deepseek
+langchain-huggingface
+sqlalchemy
+faiss-cpu
+sentence-transformers
+tiktoken
+google-generativeai
+ollama
