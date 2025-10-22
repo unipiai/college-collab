@@ -10,7 +10,6 @@ langchain-google-genai
 langchain-deepseek
 langchain-huggingface
 sqlalchemy
-faiss-cpu
 sentence-transformers
 tiktoken
 google-generativeai
